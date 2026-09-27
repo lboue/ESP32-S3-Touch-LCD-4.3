@@ -8,29 +8,43 @@
 
 static const char *TAG = "example";
 
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
+
 static esp_err_t i2c_master_init(void)
 {
-    static bool i2c_initialized = false;
-    const int i2c_master_port = I2C_MASTER_NUM;
-
-    if (i2c_initialized) {
+    if (s_i2c_bus != NULL) {
         return ESP_OK;
     }
 
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_MASTER_NUM,
         .sda_io_num = I2C_MASTER_SDA_IO,
         .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
 
-    ESP_RETURN_ON_ERROR(i2c_param_config(i2c_master_port, &i2c_conf), TAG, "Configure I2C failed");
-    ESP_RETURN_ON_ERROR(i2c_driver_install(i2c_master_port, i2c_conf.mode, 0, 0, 0), TAG, "Install I2C failed");
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_i2c_bus), TAG, "Create I2C master bus failed");
 
-    i2c_initialized = true;
     return ESP_OK;
+}
+
+/* The CH422G IO expander responds on several 7-bit addresses (0x24 mode,
+   0x38 output). Add a transient device for the target address, send one byte,
+   then remove it. */
+static esp_err_t ch422g_write_byte(uint8_t dev_addr, uint8_t value)
+{
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = dev_addr,
+        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &dev_config, &dev), TAG, "Add CH422G device failed");
+    esp_err_t ret = i2c_master_transmit(dev, &value, 1, I2C_MASTER_TIMEOUT_MS);
+    i2c_master_bus_rm_device(dev);
+    return ret;
 }
 
 #if CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911
@@ -46,16 +60,12 @@ static void gpio_init(void)
 
 static void waveshare_esp32_s3_touch_reset(void)
 {
-    uint8_t write_buf = 0x01;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x24, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
-
-    write_buf = 0x2C;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x38, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+    ch422g_write_byte(0x24, 0x01);
+    ch422g_write_byte(0x38, 0x2C);
     esp_rom_delay_us(100 * 1000);
     gpio_set_level(GPIO_INPUT_IO_4, 0);
     esp_rom_delay_us(100 * 1000);
-    write_buf = 0x2E;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x38, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+    ch422g_write_byte(0x38, 0x2E);
     esp_rom_delay_us(200 * 1000);
 }
 #endif
@@ -96,11 +106,9 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init(
             },
         },
         .data_width = EXAMPLE_RGB_DATA_WIDTH,
-        .bits_per_pixel = EXAMPLE_RGB_BIT_PER_PIXEL,
         .num_fbs = frame_buffer_count,
         .bounce_buffer_size_px = EXAMPLE_RGB_BOUNCE_BUFFER_SIZE,
-        .sram_trans_align = 4,
-        .psram_trans_align = 64,
+        .dma_burst_size = 64,
         .hsync_gpio_num = EXAMPLE_LCD_IO_RGB_HSYNC,
         .vsync_gpio_num = EXAMPLE_LCD_IO_RGB_VSYNC,
         .de_gpio_num = EXAMPLE_LCD_IO_RGB_DE,
@@ -144,11 +152,11 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init(
 
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
-    tp_io_config.scl_speed_hz = 0;
+    tp_io_config.scl_speed_hz = I2C_MASTER_FREQ_HZ;
 
     ESP_LOGI(TAG, "Initialize I2C panel IO");
     ESP_RETURN_ON_ERROR(
-        esp_lcd_new_panel_io_i2c((esp_lcd_i2c_bus_handle_t)I2C_MASTER_NUM, &tp_io_config, &tp_io_handle),
+        esp_lcd_new_panel_io_i2c(s_i2c_bus, &tp_io_config, &tp_io_handle),
         TAG, "Create touch IO failed"
     );
 
@@ -176,17 +184,8 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init(
 
 esp_err_t waveshare_rgb_lcd_backlight_on(void)
 {
-    uint8_t write_buf = 0x01;
     ESP_RETURN_ON_ERROR(i2c_master_init(), TAG, "Initialize I2C failed");
-    ESP_RETURN_ON_ERROR(
-        i2c_master_write_to_device(I2C_MASTER_NUM, 0x24, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS),
-        TAG, "Configure CH422G failed"
-    );
-
-    write_buf = 0x1E;
-    ESP_RETURN_ON_ERROR(
-        i2c_master_write_to_device(I2C_MASTER_NUM, 0x38, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS),
-        TAG, "Enable backlight failed"
-    );
+    ESP_RETURN_ON_ERROR(ch422g_write_byte(0x24, 0x01), TAG, "Configure CH422G failed");
+    ESP_RETURN_ON_ERROR(ch422g_write_byte(0x38, 0x1E), TAG, "Enable backlight failed");
     return ESP_OK;
 }
